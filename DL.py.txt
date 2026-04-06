@@ -1,0 +1,136 @@
+import os
+import cv2
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.applications import MobileNetV2
+from tensorflow.keras.layers import Dense, GlobalAveragePooling2D, Dropout, Input
+from tensorflow.keras.models import Model, load_model
+
+# Configuration
+MODEL_FILE = "mask_detector.h5"
+IMG_SIZE = (224, 224)
+DATASET_DIR = 'dataset/' 
+
+# =================================================================
+# STEP 1: MODEL PREPARATION
+# =================================================================
+def get_model():
+    if os.path.exists(MODEL_FILE):
+        print("[INFO] Loading existing model...")
+        return load_model(MODEL_FILE, compile=False)
+    
+    print("[INFO] Training new model...")
+    if not os.path.exists(DATASET_DIR):
+        print(f"[WARNING] '{DATASET_DIR}' not found. Creating a functional placeholder model.")
+        # Create a model with ImageNet weights so it can at least process shapes
+        base = MobileNetV2(weights='imagenet', include_top=False, input_shape=(224,224,3))
+        x = GlobalAveragePooling2D()(base.output)
+        x = Dense(128, activation='relu')(x)
+        out = Dense(1, activation='sigmoid')(x)
+        model = Model(inputs=base.input, outputs=out)
+        model.compile(optimizer='adam', loss='binary_crossentropy')
+        return model
+
+    # Data Augmentation
+    datagen = ImageDataGenerator(rescale=1./255, validation_split=0.2, horizontal_flip=True)
+    train_gen = datagen.flow_from_directory(DATASET_DIR, target_size=IMG_SIZE, batch_size=32, class_mode='binary', subset='training')
+    val_gen = datagen.flow_from_directory(DATASET_DIR, target_size=IMG_SIZE, batch_size=32, class_mode='binary', subset='validation')
+
+    base_model = MobileNetV2(weights='imagenet', include_top=False, input_tensor=Input(shape=(224, 224, 3)))
+    base_model.trainable = False
+
+    x = GlobalAveragePooling2D()(base_model.output)
+    x = Dense(128, activation='relu')(x)
+    x = Dropout(0.5)(x)
+    output = Dense(1, activation='sigmoid')(x)
+
+    model = Model(inputs=base_model.input, outputs=output)
+    model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+    model.fit(train_gen, validation_data=val_gen, epochs=3)
+    model.save(MODEL_FILE)
+    return model
+
+# Initialize the model
+model = get_model()
+
+# =================================================================
+# STEP 2: REAL-TIME INFERENCE (With Simulation Fallback)
+# =================================================================
+
+# Load Face Cascade
+cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+face_cascade = cv2.CascadeClassifier(cascade_path)
+
+# Try to initialize webcam
+cap = cv2.VideoCapture(0)
+using_simulation = False
+
+if not cap.isOpened():
+    print("[WARNING] Webcam not detected. Switching to Simulation Mode.")
+    using_simulation = True
+    # Create a blank image to simulate a frame if no camera is found
+    # In a real scenario, you could load a static image here: cv2.imread('test.jpg')
+    simulation_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    cv2.putText(simulation_frame, "SIMULATION: No Webcam Found", (50, 240), 
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+
+print("[INFO] Detection started. Press 'q' to quit.")
+
+try:
+    frame_count = 0
+    while True:
+        if using_simulation:
+            frame = simulation_frame.copy()
+            ret = True
+            # Simulate exit after some cycles if headless
+            frame_count += 1
+            if frame_count > 10: break 
+        else:
+            ret, frame = cap.read()
+        
+        if not ret:
+            break
+
+        # 1. Detection
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, 1.1, 5, minSize=(60, 60))
+
+        if len(faces) == 0 and using_simulation:
+            # Just for visual feedback in the console during simulation
+            print("[INFO] Scanning for faces...")
+
+        for (x, y, w, h) in faces:
+            # 2. Preprocess
+            face_roi = frame[y:y+h, x:x+w]
+            face_rgb = cv2.cvtColor(face_roi, cv2.COLOR_BGR2RGB)
+            face_resized = cv2.resize(face_rgb, IMG_SIZE)
+            face_array = np.expand_dims(face_resized / 255.0, axis=0).astype(np.float32)
+
+            # 3. Predict
+            prediction = model(face_array, training=False).numpy()[0][0]
+
+            # 4. Result Logic
+            label = "Mask" if prediction < 0.5 else "No Mask"
+            color = (0, 255, 0) if label == "Mask" else (0, 0, 255)
+            conf = (1 - prediction) if prediction < 0.5 else prediction
+            
+            print(f"[DETECTED] {label} ({conf*100:.1f}%)")
+
+            cv2.putText(frame, f"{label}: {conf*100:.1f}%", (x, y - 10), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+
+        # 5. Display with headless protection
+        try:
+            cv2.imshow("Face Mask Detector", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+        except Exception:
+            # Silence the error but keep the loop running for console logs
+            pass
+
+finally:
+    cap.release()
+    cv2.destroyAllWindows()
+    print("[INFO] Resources released.")
